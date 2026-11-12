@@ -1,4 +1,4 @@
-from typing import List, FrozenSet, Dict, Tuple, Union
+from typing import List, FrozenSet, Dict, Tuple, Union, Optional
 from dataclasses import dataclass
 
 try:
@@ -12,13 +12,19 @@ except ImportError:
     def create_decoder(pcm, priors, **kwargs):
         return bp_decoder(parity_check_matrix=pcm, channel_probs=priors, **kwargs)
 
-
-from ldpc import bp_decoder
 from scipy.sparse import csc_matrix
 import numpy as np
 
+import inspect
+
 import stim
 import pymatching
+
+# Unreleased pymatching feature (https://github.com/oscarhiggott/PyMatching/issues/172) for temporarily
+# reweighting edges of an existing graph for a single shot.
+_PYMATCHING_SUPPORTS_EDGE_REWEIGHTS = (
+    "edge_reweights" in inspect.signature(pymatching.Matching.decode).parameters
+)
 
 
 def iter_set_xor(set_list: List[List[int]]) -> FrozenSet[int]:
@@ -190,7 +196,8 @@ class BeliefMatching:
         self,
         model: Union[stim.Circuit, stim.DetectorErrorModel],
         max_bp_iters: int = 20,
-        bp_method: str = "product_sum",
+        bp_method: Optional[str] = None,
+        bp_backend: str = "ldpc",
         **kwargs,
     ):
         """
@@ -205,20 +212,32 @@ class BeliefMatching:
             into edges (using `decompose_errors=True`) for BeliefMatching to provide improved accuracy over
             a standard (faster) MWPM decoder.
         max_bp_iters : int
-            The maximum number of interations of belief-propagation to use. Passed to
-            `ldpc.bp_decoder` as the `max_iter` argument. Default 20
-        bp_method : str
-            The method of belief-propagation to use. Passed to
-            `ldpc.bp_decoder` as the `bp_method` argument. Options include "product_sum",
-             "minimum_sum", "product_sum_log" and "minimum_sum_log" (see https://github.com/quantumgizmos/ldpc
-             for details). Default is "product_sum"
+            The maximum number of iterations of belief-propagation to use. Default 20
+        bp_method : str, optional
+            The method of belief-propagation to use. With `bp_backend="ldpc"` this is passed to
+            `ldpc.BpDecoder` as the `bp_method` argument; options are "product_sum" (alias "ps") and
+            "minimum_sum" (aliases "min_sum", "ms"). The default is "product_sum". The "relay" backend only
+            supports min-sum, so with it this must be None or a min-sum alias.
+        bp_backend : str
+            The belief-propagation implementation to use:
+
+            - "ldpc" (default): `ldpc.BpDecoder` (https://github.com/quantumgizmos/ldpc).
+            - "relay": the Rust min-sum BP decoder `relay_bp.MinSumBPDecoderF64` from relay-bp
+              (https://github.com/trmue/relay). Requires `pip install relay-bp`.
         kwargs
-            Additional keyword arguments are passed to `ldpc.bp_decoder`
+            Additional keyword arguments are passed to the BP decoder's constructor (`ldpc.BpDecoder` or
+            `relay_bp.MinSumBPDecoderF64`). The min-sum scaling factor can be given as `ms_scaling_factor`
+            for either backend (for "relay" it is passed on as `alpha`). For both backends, a value in (0, 1]
+            scales the check-to-variable messages by that constant, and 0 uses the adaptive schedule
+            1 - 2^-(iteration + 1).
         """
         if isinstance(model, stim.Circuit):
             model = model.detector_error_model(decompose_errors=True)
         self._initialise_from_detector_error_model(
-            model=model, max_bp_iters=max_bp_iters, bp_method=bp_method, **kwargs
+            model=model, max_bp_iters=max_bp_iters,
+            bp_method=bp_method,
+            bp_backend=bp_backend,
+            **kwargs,
         )
 
     def _initialise_from_detector_error_model(
@@ -226,19 +245,90 @@ class BeliefMatching:
         model: stim.DetectorErrorModel,
         *,
         max_bp_iters: int = 20,
-        bp_method: str = "product_sum",
+        bp_method: Optional[str] = None,
+        bp_backend: str = "ldpc",
         **kwargs,
     ):
         self._model = model
         self._matrices = detector_error_model_to_check_matrices(self._model)
-        self._bpd = create_decoder(
-            pcm=self._matrices.check_matrix,
-            priors=self._matrices.priors,
-            max_iter=max_bp_iters,
-            bp_method=bp_method,
-            input_vector_type="syndrome",
-            **kwargs,
+        self._bp_backend = bp_backend
+        if bp_backend == "ldpc":
+            self._bpd = create_decoder(
+                pcm=self._matrices.check_matrix,
+                priors=self._matrices.priors,
+                max_iter=max_bp_iters,
+                bp_method="product_sum" if bp_method is None else bp_method,
+                input_vector_type="syndrome",
+                **kwargs,
+            )
+        elif bp_backend == "relay":
+            if bp_method not in (None, "minimum_sum", "min_sum", "ms"):
+                raise ValueError(
+                    f"bp_backend='relay' only supports min-sum BP, but bp_method={bp_method!r} was given."
+                )
+            try:
+                import relay_bp
+            except ImportError as e:
+                raise ImportError(
+                    "bp_backend='relay' requires the relay-bp package: `pip install relay-bp`."
+                ) from e
+            if "ms_scaling_factor" in kwargs:
+                if "alpha" in kwargs:
+                    raise ValueError("Give only one of `ms_scaling_factor` and `alpha`.")
+                kwargs["alpha"] = float(kwargs.pop("ms_scaling_factor"))
+            self._bpd = relay_bp.MinSumBPDecoderF64(
+                self._matrices.check_matrix.astype(np.uint8),
+                error_priors=np.asarray(self._matrices.priors, dtype=np.float64),
+                max_iter=max_bp_iters,
+                **kwargs,
+            )
+        else:
+            raise ValueError(
+                f"Unknown bp_backend {bp_backend!r}. Options are 'ldpc' and 'relay'."
+            )
+        self._setup_edge_reweighting()
+
+    def _setup_edge_reweighting(self) -> None:
+        """If the installed pymatching supports `edge_reweights` in `Matching.decode`, build the matching
+        graph once (weighted by the prior edge probabilities) so that each shot only needs to temporarily
+        reweight its edges, instead of constructing a new `Matching` object per shot."""
+        self._base_matching = None
+        self._edge_reweights = None
+        if not _PYMATCHING_SUPPORTS_EDGE_REWEIGHTS:
+            return
+        eps = 1e-14
+        edge_priors = np.clip(
+            self._matrices.hyperedge_to_edge_matrix @ self._matrices.priors, eps, 1 - eps
         )
+        base_weights = -np.log(edge_priors)
+        # pymatching does not allow reweighting to change an edge's sign, and discretises new weights using
+        # the base graph's scale, which leaves headroom for weights up to ~64x the largest base weight. The
+        # largest weight `decode` can produce is -log(eps) ~= 32.2.
+        if base_weights.min() < 0 or base_weights.max() * 32 < -np.log(eps):
+            return
+        h = self._matrices.edge_check_matrix.tocsc()
+        if np.any(np.diff(h.indptr) > 2) or np.any(np.diff(h.indptr) == 0):
+            return
+        edge_reweights = np.full((h.shape[1], 3), -1.0, dtype=np.float64)
+        for j in range(h.shape[1]):
+            rows = h.indices[h.indptr[j] : h.indptr[j + 1]]
+            edge_reweights[j, : len(rows)] = rows
+        self._base_matching = pymatching.Matching.from_check_matrix(
+            h,
+            weights=base_weights,
+            faults_matrix=self._matrices.edge_observables_matrix,
+            use_virtual_boundary_node=True,
+        )
+        self._edge_reweights = edge_reweights
+
+    def _run_bp(self, syndrome: np.ndarray) -> Tuple[bool, np.ndarray, np.ndarray]:
+        """Run BP on a single syndrome. Returns (converged, correction, log-likelihood ratios), where
+        the LLRs are log(P(no error) / P(error)) for each column of the check matrix."""
+        if self._bp_backend == "relay":
+            res = self._bpd.decode_detailed(np.ascontiguousarray(syndrome, dtype=np.uint8))
+            return res.success, res.decoding, res.posterior_ratios
+        corr = self._bpd.decode(syndrome)
+        return bool(self._bpd.converge), corr, self._bpd.log_prob_ratios
 
     @classmethod
     def from_detector_error_model(
@@ -246,7 +336,8 @@ class BeliefMatching:
         model: stim.DetectorErrorModel,
         *,
         max_bp_iters: int = 20,
-        bp_method: str = "product_sum",
+        bp_method: Optional[str] = None,
+        bp_backend: str = "ldpc",
         **kwargs,
     ) -> "BeliefMatching":
         """
@@ -259,15 +350,24 @@ class BeliefMatching:
             into edges (using `decompose_errors=True`) for BeliefMatching to provide improved accuracy over
             a standard (faster) MWPM decoder.
         max_bp_iters : int
-            The maximum number of interations of belief-propagation to use. Passed to
-            `ldpc.bp_decoder` as the `max_iter` argument. Default 20
-        bp_method : str
-            The method of belief-propagation to use. Passed to
-            `ldpc.bp_decoder` as the `bp_method` argument. Options include "product_sum",
-             "minimum_sum", "product_sum_log" and "minimum_sum_log" (see https://github.com/quantumgizmos/ldpc
-             for details). Default is "product_sum"
+            The maximum number of iterations of belief-propagation to use. Default 20
+        bp_method : str, optional
+            The method of belief-propagation to use. With `bp_backend="ldpc"` this is passed to
+            `ldpc.BpDecoder` as the `bp_method` argument; options are "product_sum" (alias "ps") and
+            "minimum_sum" (aliases "min_sum", "ms"). The default is "product_sum". The "relay" backend only
+            supports min-sum, so with it this must be None or a min-sum alias.
+        bp_backend : str
+            The belief-propagation implementation to use:
+
+            - "ldpc" (default): `ldpc.BpDecoder` (https://github.com/quantumgizmos/ldpc).
+            - "relay": the Rust min-sum BP decoder `relay_bp.MinSumBPDecoderF64` from relay-bp
+              (https://github.com/trmue/relay). Requires `pip install relay-bp`.
         kwargs
-            Additional keyword arguments are passed to `ldpc.bp_decoder`
+            Additional keyword arguments are passed to the BP decoder's constructor (`ldpc.BpDecoder` or
+            `relay_bp.MinSumBPDecoderF64`). The min-sum scaling factor can be given as `ms_scaling_factor`
+            for either backend (for "relay" it is passed on as `alpha`). For both backends, a value in (0, 1]
+            scales the check-to-variable messages by that constant, and 0 uses the adaptive schedule
+            1 - 2^-(iteration + 1).
 
 
         Returns
@@ -277,7 +377,10 @@ class BeliefMatching:
         """
         bm = cls.__new__(cls)
         bm._initialise_from_detector_error_model(
-            model=model, max_bp_iters=max_bp_iters, bp_method=bp_method, **kwargs
+            model=model, max_bp_iters=max_bp_iters,
+            bp_method=bp_method,
+            bp_backend=bp_backend,
+            **kwargs,
         )
         return bm
 
@@ -287,7 +390,8 @@ class BeliefMatching:
         circuit: stim.Circuit,
         *,
         max_bp_iters: int = 20,
-        bp_method: str = "product_sum",
+        bp_method: Optional[str] = None,
+        bp_backend: str = "ldpc",
         **kwargs,
     ) -> "BeliefMatching":
         """
@@ -299,15 +403,24 @@ class BeliefMatching:
             A stim.Circuit. The circuit will be converted into a stim.DetectorErrorModel using
             `stim.Circuit.detector_error_model(decompose_errors=True)`.
         max_bp_iters : int
-            The maximum number of interations of belief-propagation to use. Passed to
-            `ldpc.bp_decoder` as the `max_iter` argument. Default 20
-        bp_method : str
-            The method of belief-propagation to use. Passed to
-            `ldpc.bp_decoder` as the `bp_method` argument. Options include "product_sum",
-             "minimum_sum", "product_sum_log" and "minimum_sum_log" (see https://github.com/quantumgizmos/ldpc
-             for details). Default is "product_sum"
+            The maximum number of iterations of belief-propagation to use. Default 20
+        bp_method : str, optional
+            The method of belief-propagation to use. With `bp_backend="ldpc"` this is passed to
+            `ldpc.BpDecoder` as the `bp_method` argument; options are "product_sum" (alias "ps") and
+            "minimum_sum" (aliases "min_sum", "ms"). The default is "product_sum". The "relay" backend only
+            supports min-sum, so with it this must be None or a min-sum alias.
+        bp_backend : str
+            The belief-propagation implementation to use:
+
+            - "ldpc" (default): `ldpc.BpDecoder` (https://github.com/quantumgizmos/ldpc).
+            - "relay": the Rust min-sum BP decoder `relay_bp.MinSumBPDecoderF64` from relay-bp
+              (https://github.com/trmue/relay). Requires `pip install relay-bp`.
         kwargs
-            Additional keyword arguments are passed to `ldpc.bp_decoder`
+            Additional keyword arguments are passed to the BP decoder's constructor (`ldpc.BpDecoder` or
+            `relay_bp.MinSumBPDecoderF64`). The min-sum scaling factor can be given as `ms_scaling_factor`
+            for either backend (for "relay" it is passed on as `alpha`). For both backends, a value in (0, 1]
+            scales the check-to-variable messages by that constant, and 0 uses the adaptive schedule
+            1 - 2^-(iteration + 1).
 
 
         Returns
@@ -318,7 +431,10 @@ class BeliefMatching:
         bm = cls.__new__(cls)
         model = circuit.detector_error_model(decompose_errors=True)
         bm._initialise_from_detector_error_model(
-            model=model, max_bp_iters=max_bp_iters, bp_method=bp_method, **kwargs
+            model=model, max_bp_iters=max_bp_iters,
+            bp_method=bp_method,
+            bp_backend=bp_backend,
+            **kwargs,
         )
         return bm
 
@@ -340,18 +456,24 @@ class BeliefMatching:
             Its length is equal to the number of observables in the `stim.Circuit` or `stim.DetectorErrorModel`.
             `predictions[i]` is 1 if the decoder predicts observable `i` was flipped and 0 otherwise.
         """
-        corr = self._bpd.decode(syndrome)
-        if self._bpd.converge:
+        converged, corr, llrs = self._run_bp(syndrome)
+        if converged:
             return (self._matrices.observables_matrix @ corr) % 2
-        llrs = self._bpd.log_prob_ratios
         ps_h = 1 / (1 + np.exp(llrs))
         ps_e = self._matrices.hyperedge_to_edge_matrix @ ps_h
         eps = 1e-14
         ps_e[ps_e > 1 - eps] = 1 - eps
         ps_e[ps_e < eps] = eps
+        weights = -np.log(ps_e)
+        if self._edge_reweights is not None and weights.min() >= 0:
+            # Fast path: temporarily reweight the prebuilt matching graph instead of rebuilding it.
+            self._edge_reweights[:, 2] = weights
+            return self._base_matching.decode(
+                syndrome, edge_reweights=self._edge_reweights
+            )
         matching = pymatching.Matching.from_check_matrix(
             self._matrices.edge_check_matrix,
-            weights=-np.log(ps_e),
+            weights=weights,
             faults_matrix=self._matrices.edge_observables_matrix,
             use_virtual_boundary_node=True,
         )

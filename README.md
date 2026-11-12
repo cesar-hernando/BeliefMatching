@@ -30,6 +30,18 @@ pip install -e .
 ```
 from the root directory.
 
+### Optional: relay-bp backend
+
+BP can alternatively be run with the Rust min-sum BP decoder from [relay-bp](https://github.com/trmue/relay), 
+which gives the same posteriors as ldpc's min-sum BP but is faster:
+```shell
+pip install "beliefmatching[relay]"
+```
+```python
+bm = BeliefMatching(circuit, bp_backend="relay", max_bp_iters=20, ms_scaling_factor=0.625)
+```
+The same options can be passed to `BeliefMatchingSinterDecoder`. The relay backend supports min-sum BP only.
+
 ## Usage
 
 Here is an example of how the decoder can be used directly with Stim:

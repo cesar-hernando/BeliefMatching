@@ -24,4 +24,5 @@ setup(
         "sinter>=1.11",
         "numpy<=2.2.6",
     ],
+    extras_require={"relay": ["relay-bp"]},
 )

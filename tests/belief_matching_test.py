@@ -1,3 +1,4 @@
+import importlib.util
 import os
 from typing import List
 
@@ -197,3 +198,78 @@ def test_belief_matching_sinter_multiple_obs():
         decoders=["beliefmatching"],
         custom_decoders={"beliefmatching": BeliefMatchingSinterDecoder()},
     )
+
+
+def test_relay_backend_matches_ldpc_min_sum():
+    pytest.importorskip("relay_bp")
+    test_dir = os.path.dirname(os.path.realpath(__file__))
+    circuit = stim.Circuit.from_file(
+        os.path.join(test_dir, "surface_code_rotated_memory_x_d_7_p_0.007.stim")
+    )
+    dem = circuit.detector_error_model(decompose_errors=True)
+    shot_data = stim.read_shot_data_file(
+        path=os.path.join(
+            test_dir, "surface_code_rotated_memory_x_d_7_p_0.007_500_shots.b8"
+        ),
+        format="b8",
+        num_detectors=dem.num_detectors,
+        num_observables=dem.num_observables,
+    )
+    shots = shot_data[:100, 0 : dem.num_detectors]
+
+    for scaling in (0.625, 0):
+        bm_ldpc = BeliefMatching(
+            dem, max_bp_iters=5, bp_method="min_sum", ms_scaling_factor=scaling
+        )
+        bm_relay = BeliefMatching(
+            dem, max_bp_iters=5, bp_backend="relay", ms_scaling_factor=scaling
+        )
+        for s in shots:
+            conv_l, _, llr_l = bm_ldpc._run_bp(s)
+            conv_r, _, llr_r = bm_relay._run_bp(s)
+            assert conv_l == conv_r
+            np.testing.assert_allclose(llr_l, llr_r, rtol=1e-9, atol=1e-9)
+        np.testing.assert_array_equal(
+            bm_ldpc.decode_batch(shots), bm_relay.decode_batch(shots)
+        )
+
+
+def test_invalid_bp_backend_options():
+    dem = stim.DetectorErrorModel("error(0.1) D0\nerror(0.1) D0 D1\nerror(0.1) D1 L0")
+    with pytest.raises(ValueError):
+        BeliefMatching(dem, bp_backend="not_a_backend")
+    if importlib.util.find_spec("relay_bp") is not None:
+        with pytest.raises(ValueError):
+            BeliefMatching(dem, bp_backend="relay", bp_method="product_sum")
+
+
+def test_belief_matching_sinter_relay_backend():
+    pytest.importorskip("relay_bp")
+    sinter.collect(
+        num_workers=1,
+        max_shots=200,
+        tasks=generate_trivial_circuit_task(),
+        decoders=["beliefmatching-relay"],
+        custom_decoders={
+            "beliefmatching-relay": BeliefMatchingSinterDecoder(
+                bp_backend="relay", ms_scaling_factor=0.625
+            )
+        },
+    )
+
+
+def test_edge_reweighting_matches_graph_rebuild():
+    from beliefmatching import belief_matching as bm_module
+
+    if not bm_module._PYMATCHING_SUPPORTS_EDGE_REWEIGHTS:
+        pytest.skip("installed pymatching does not support edge_reweights")
+    test_dir = os.path.dirname(os.path.realpath(__file__))
+    circuit = stim.Circuit.from_file(
+        os.path.join(test_dir, "surface_code_rotated_memory_x_d_7_p_0.007.stim")
+    )
+    shots = circuit.compile_detector_sampler(seed=0).sample(100)
+    fast = BeliefMatching(circuit, max_bp_iters=5, bp_method="min_sum", ms_scaling_factor=0.625)
+    assert fast._edge_reweights is not None
+    slow = BeliefMatching(circuit, max_bp_iters=5, bp_method="min_sum", ms_scaling_factor=0.625)
+    slow._edge_reweights = None
+    np.testing.assert_array_equal(fast.decode_batch(shots), slow.decode_batch(shots))
